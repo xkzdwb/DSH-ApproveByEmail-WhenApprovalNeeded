@@ -11,6 +11,14 @@ export const DEFAULTS = {
   to: '',                      // 收件人；留空 = 发给 address（想「用 A 发给 B」就在这里写 B）
   displayName: 'DSH 审批',
   subjectPrefix: '[DSH 审批]',
+  questionSubjectPrefix: '[DSH 提问]',
+  // 审批是否同时在界面弹卡。默认 false：审批卡一旦弹出就没有 Host 侧的关闭通道
+  // （客户端只在用户点击或该客户端插件卸载时销毁它），邮件批完会一直留在屏幕上。
+  showApprovalCard: false,
+  // 提问是否同时在界面弹选项卡。默认 false，理由相同且已用源码确认：
+  // 客户端只要还握着那条转发请求（card.hasRequest() / hasWaterfall()），就永不删卡，
+  // 投影怎么变都没用。所以邮件答完时卡片收不掉 —— 干脆不弹。
+  showQuestionCard: false,
   secretsFile: '',             // 放授权码的 JSON 文件；也可直接在 config 里写 authCode
   authCode: '',
   smtp: DEFAULT_SMTP,
@@ -88,6 +96,9 @@ export function readSettings(rawConfig) {
     authCode,
     displayName: String(value(input.displayName, DEFAULTS.displayName)),
     subjectPrefix: String(value(input.subjectPrefix, DEFAULTS.subjectPrefix)),
+    questionSubjectPrefix: String(value(input.questionSubjectPrefix, DEFAULTS.questionSubjectPrefix)),
+    showApprovalCard: value(input.showApprovalCard, DEFAULTS.showApprovalCard) === true,
+    showQuestionCard: value(input.showQuestionCard, DEFAULTS.showQuestionCard) === true,
     smtp: {
       host: String(smtp.host),
       port: Number(smtp.port),

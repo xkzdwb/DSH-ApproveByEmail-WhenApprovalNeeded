@@ -12,6 +12,7 @@ import { readSettings } from '../src/config.mjs'
 import { sendMail } from '../src/mail-smtp.mjs'
 import { MailboxWatcher } from '../src/mail-imap.mjs'
 import { createAnswerer } from '../src/answerer.mjs'
+import { buildQuestionMail, interpretAnswer } from '../src/questions.mjs'
 
 const ADDRESS = 'sender@example.com'
 let pass = 0
@@ -120,25 +121,25 @@ check('extractNewText 砍掉「发件人：」式引用', () => {
   assert.equal(extractNewText(text), '拒绝 #abc123')
 })
 check('相邻 RFC2047 编码词之间的空白要丢掉（163 实测会把长主题切两段）', () => {
-  const half1 = encodeHeader('回复：[DSH 审批] #40c10f')
-  const half2 = encodeHeader('69 需要你批准： probe-mail')
-  assert.equal(decodeWords(`${half1} ${half2}`), '回复：[DSH 审批] #40c10f69 需要你批准： probe-mail')
+  const half1 = encodeHeader('回复：[DSH 审批] #abcd123')
+  const half2 = encodeHeader('4 需要你批准： probe-mail')
+  assert.equal(decodeWords(`${half1} ${half2}`), '回复：[DSH 审批] #abcd1234 需要你批准： probe-mail')
 })
 check('编码词与后面的地址之间那个空格必须留着', () => {
   assert.equal(decodeWords(`${encodeHeader('审批人')} <approver@example.com>`), '审批人 <approver@example.com>')
 })
 check('extractNewText 砍掉 163 的「---- 回复的原邮件 ----」+ 管道表格', () => {
   const text = [
-    '拒绝 #40c10f69',
+    '拒绝 #abcd1234',
     '',
     '---- 回复的原邮件 ----',
     '| 发件人 | DSH 审批<sender@example.com> |',
-    '| 主题 | [DSH 审批] #40c10f69 需要你批准：probe-mail |',
+    '| 主题 | [DSH 审批] #abcd1234 需要你批准：probe-mail |',
     '',
-    '批准 → 正文写「同意 #40c10f69」',
-    '拒绝 → 正文写「拒绝 #40c10f69」',
+    '批准 → 正文写「同意 #abcd1234」',
+    '拒绝 → 正文写「拒绝 #abcd1234」',
   ].join('\n')
-  assert.equal(extractNewText(text), '拒绝 #40c10f69')
+  assert.equal(extractNewText(text), '拒绝 #abcd1234')
 })
 
 // ---------------------------------------------------------------- 令牌
@@ -250,7 +251,7 @@ function real163Reply({ token, decision, uid = 900 }) {
   ].join('\n')
   const boundary = '----=_Part_2784412_721491841.1793865483897'
   const header = [
-    `From: ${Buffer.from('审批人（Approver）', 'utf8').toString('latin1')} <approver@example.com>`,
+    `From: ${Buffer.from('审批人（X.K.Star）', 'utf8').toString('latin1')} <approver@example.com>`,
     'To: sender <sender@example.com>',
     `Subject: ${encodeHeader(subjectHalf1)} ${encodeHeader(subjectHalf2)}`,
     `Message-ID: <reply-${uid}@163.com>`,
@@ -279,21 +280,21 @@ function real163Reply({ token, decision, uid = 900 }) {
 
 group('真实 163 回复格式（照抄实测邮件）')
 check('主题被切成两个编码词时，令牌仍能完整取出', () => {
-  const message = real163Reply({ token: '40c10f69', decision: '同意' })
+  const message = real163Reply({ token: 'abcd1234', decision: '同意' })
   const envelope = screenHeaders(message.headerText, { address: 'sender@example.com', allowFrom: ['approver@example.com'] })
   assert.equal(envelope.from, 'approver@example.com')
-  assert.match(envelope.subject, /#40c10f69/, '主题里的令牌必须完整，不能被空格切开')
+  assert.match(envelope.subject, /#abcd1234/, '主题里的令牌必须完整，不能被空格切开')
   assert.match(envelope.subject, /^回复：/, '「回复：」前缀要认得出这是回复')
 })
 check('同意 → allow（引用区里的模板不能被算作你的意思）', () => {
-  const message = real163Reply({ token: '40c10f69', decision: '同意' })
-  const result = readDecision({ headerText: message.headerText, bodyText: message.bodyText, tokens: ['40c10f69'] })
-  assert.equal(result.token, '40c10f69')
+  const message = real163Reply({ token: 'abcd1234', decision: '同意' })
+  const result = readDecision({ headerText: message.headerText, bodyText: message.bodyText, tokens: ['abcd1234'] })
+  assert.equal(result.token, 'abcd1234')
   assert.equal(result.decision, 'allow')
 })
 check('拒绝 → deny（这是之前会被引用区里的「同意」污染成歧义的场景）', () => {
-  const message = real163Reply({ token: '40c10f69', decision: '拒绝' })
-  const result = readDecision({ headerText: message.headerText, bodyText: message.bodyText, tokens: ['40c10f69'] })
+  const message = real163Reply({ token: 'abcd1234', decision: '拒绝' })
+  const result = readDecision({ headerText: message.headerText, bodyText: message.bodyText, tokens: ['abcd1234'] })
   assert.equal(result.decision, 'deny', `实测格式下拒绝必须判成 deny，实际 note=${result.note}`)
 })
 
@@ -447,6 +448,8 @@ await checkAsync('端到端：界面先点 → 界面结论说了算，待办清
     smtp: { host: '127.0.0.1', port: smtp.port, secure: false },
     imap: { host: '127.0.0.1', port: imap.port, secure: false },
     pollIntervalMs: 30,
+    // 并行抢答要显式打开界面卡（默认关，因为审批卡关不掉）
+    showApprovalCard: true,
     auditFile: join(scratch, 'audit2.jsonl'),
   })
   const answerer = createAnswerer({
@@ -508,6 +511,208 @@ await checkAsync('仅通知模式：只发信，不参与放行', async () => {
     assert.equal(outcome, 'rejected')
     await waitFor(() => smtp.messages.length === 1, { what: '通知邮件发出' })
     assert.equal(answerer.pendingCount(), 0)
+  } finally {
+    await answerer.stop()
+    await smtp.close()
+  }
+})
+
+// ---------------------------------------------------------------- 提问（user-questions）
+
+/** 造一封「回答提问」的回复邮件，带上 163 那种引用区（引用里含选项清单，专门用来验证隔离）。 */
+function questionReply({ uid = 900, token, body }) {
+  const subject = `回复：[DSH 提问] #${token} 需要你选择：方案`
+  const quoted = [
+    '',
+    '---- 回复的原邮件 ----',
+    '| 发件人 | DSH 审批<sender@example.com> |',
+    `| 主题 | [DSH 提问] #${token} 需要你选择：方案 |`,
+    '',
+    '【问题 1】方案',
+    '  1) A 方案 — 改动小',
+    '  2) B 方案 — 更彻底',
+    '【怎么回】1. 2 = 第 1 题选第 2 个选项',
+  ].join('\n')
+  const header = [
+    'From: 审批人 <approver@example.com>',
+    'To: sender@example.com',
+    `Subject: ${encodeHeader(subject)}`,
+    `Message-ID: <qreply-${uid}@example.com>`,
+    'In-Reply-To: <dsh-questions-abc@example.com>',
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+  ].join('\r\n')
+  const full = `${header}\r\n${Buffer.from(`${body}\n${quoted}\n`, 'utf8').toString('base64')}`
+  const { headerText, body: bodyText } = splitMessage(full)
+  // 假 IMAP 服务端要 header/body；解析函数要 headerText/bodyText。两个都给。
+  return { uid, header: headerText, body: bodyText, headerText, bodyText }
+}
+
+group('提问：邮件渲染与回复解析')
+const QUESTION_REQUEST = {
+  questions: [
+    { id: 'q1', header: '方案', question: '用哪个方案？', options: [{ label: 'A 方案', description: '改动小' }, { label: 'B 方案', description: '更彻底' }] },
+    { id: 'q2', question: '要不要顺便补测试？', options: [{ label: '要' }, { label: '不要' }] },
+  ],
+}
+
+check('提问邮件里能看到题号、选项与「怎么回」', () => {
+  const { subject, text } = buildQuestionMail({ settings: readSettings({ address: ADDRESS, authCode: 'x' }), token: 'abcd1234', request: QUESTION_REQUEST })
+  assert.match(subject, /\[DSH 提问\] #abcd1234/)
+  assert.match(text, /【问题 1】方案/)
+  assert.match(text, /1\) A 方案 — 改动小/)
+  assert.match(text, /2\) B 方案/)
+  assert.match(text, /1\. 2/)
+})
+check('按题号+选项号作答', () => {
+  const message = questionReply({ uid: 1, token: 'abcd1234', body: '1. 2\n2. 1' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.deepEqual(result.value, { answers: [{ id: 'q1', selected: ['B 方案'] }, { id: 'q2', selected: ['要'] }] })
+})
+check('直接写选项原文也认', () => {
+  const message = questionReply({ uid: 2, token: 'abcd1234', body: '1. A 方案\n2. 不要' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.deepEqual(result.value.answers[0].selected, ['A 方案'])
+  assert.deepEqual(result.value.answers[1].selected, ['不要'])
+})
+check('自定义答案走 custom', () => {
+  const message = questionReply({ uid: 3, token: 'abcd1234', body: '1. 自定义：两个方案折中，先 A 后 B\n2. 要' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.deepEqual(result.value.answers[0], { id: 'q1', selected: [], custom: '两个方案折中，先 A 后 B' })
+})
+check('没写的那题记为跳过（selected 为空）', () => {
+  const message = questionReply({ uid: 4, token: 'abcd1234', body: '2. 要' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.deepEqual(result.value.answers[0], { id: 'q1', selected: [] })
+  assert.deepEqual(result.value.answers[1], { id: 'q2', selected: ['要'] })
+})
+check('只有一道题时可以直接回选项号', () => {
+  const request = { questions: [{ id: 'only', question: '继续吗？', options: [{ label: '继续' }, { label: '停下' }] }] }
+  const message = questionReply({ uid: 5, token: 'abcd1234', body: '2' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request })
+  assert.deepEqual(result.value, { answers: [{ id: 'only', selected: ['停下'] }] })
+})
+check('多选保留多个标签', () => {
+  const request = { questions: [{ id: 'm', question: '要做哪些？', multiSelect: true, options: [{ label: '文档' }, { label: '测试' }, { label: '打包' }] }] }
+  const message = questionReply({ uid: 6, token: 'abcd1234', body: '1. 文档, 打包' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request })
+  assert.deepEqual(result.value, { answers: [{ id: 'm', selected: ['文档', '打包'] }] })
+})
+check('两题只回两个纯数字（一行一题）→ 按题目顺序对应', () => {
+  // 这是真机上收到过的原样回复：正文就是「1」换行「1」，没有题号也没有分隔符。
+  const message = questionReply({ uid: 9, token: 'abcd1234', body: '1\n1' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.deepEqual(result.value, { answers: [{ id: 'q1', selected: ['A 方案'] }, { id: 'q2', selected: ['要'] }] })
+})
+check('两题一行一个选项原文（不带题号）也认', () => {
+  const message = questionReply({ uid: 10, token: 'abcd1234', body: 'B 方案\n不要' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.deepEqual(result.value.answers[0].selected, ['B 方案'])
+  assert.deepEqual(result.value.answers[1].selected, ['不要'])
+})
+check('行数与题数对不上时不当成逐行作答（宁可继续等）', () => {
+  const message = questionReply({ uid: 11, token: 'abcd1234', body: '好的' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.equal(result.value, null)
+})
+check('答非所问 → 不判定（继续等）', () => {
+  const message = questionReply({ uid: 7, token: 'abcd1234', body: '（我先看看）' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.equal(result.value, null)
+})
+check('令牌对不上 → 不判定', () => {
+  const message = questionReply({ uid: 8, token: 'ffff9999', body: '1. 1' })
+  const result = interpretAnswer({ ...message, tokens: ['abcd1234'], request: QUESTION_REQUEST })
+  assert.equal(result.token, null)
+})
+
+await checkAsync('端到端：提问用邮件答完 → 返回完整答案批次', async () => {
+  const smtp = await startFakeSmtp()
+  const imap = await startFakeImap({ uidNext: 100 })
+  const settings = readSettings({
+    address: ADDRESS, authCode: 'x',
+    allowFrom: ['approver@example.com'],
+    smtp: { host: '127.0.0.1', port: smtp.port, secure: false },
+    imap: { host: '127.0.0.1', port: imap.port, secure: false },
+    pollIntervalMs: 30,
+    auditFile: join(scratch, 'audit-q.jsonl'),
+  })
+  const answerer = createAnswerer({
+    settings,
+    deps: { sendMail, createWatcher: (options) => new MailboxWatcher(options), log: () => {}, auditFile: join(scratch, 'audit-q.jsonl') },
+    kind: 'question',
+  })
+  try {
+    const answer = answerer.handle(
+      { ...QUESTION_REQUEST, agent: { id: 'a', session: { id: 's' } } },
+      () => new Promise(() => {}), // 界面那条路不回，只能靠邮件
+    )
+    await waitFor(() => smtp.messages.length === 1, { what: '提问邮件发出' })
+    const { headerText } = splitMessage(smtp.messages[0])
+    const token = extractTokens(parseHeaders(headerText).decoded('subject'))[0]
+    imap.push(questionReply({ uid: 100, token, body: '1. 2\n2. 1' }))
+    const result = await Promise.race([answer, new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), 6000))])
+    assert.notEqual(result, 'TIMEOUT', '不该超时')
+    assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['B 方案'] }, { id: 'q2', selected: ['要'] }] })
+  } finally {
+    await answerer.stop()
+    await smtp.close()
+    await imap.close()
+  }
+})
+
+await checkAsync('审批默认不弹界面卡（避免邮件批完留下关不掉的卡）', async () => {
+  const smtp = await startFakeSmtp()
+  const settings = readSettings({
+    address: ADDRESS, authCode: 'x',
+    smtp: { host: '127.0.0.1', port: smtp.port, secure: false },
+    imap: { host: '127.0.0.1', port: 1, secure: false },
+    pollIntervalMs: 30,
+    auditFile: join(scratch, 'audit-nocard.jsonl'),
+  })
+  assert.equal(settings.showApprovalCard, false, '默认必须是不弹卡')
+  const answerer = createAnswerer({
+    settings,
+    deps: { sendMail, createWatcher: (options) => new MailboxWatcher(options), log: () => {}, auditFile: join(scratch, 'audit-nocard.jsonl') },
+  })
+  let uiCalled = false
+  try {
+    // 发信成功 → 界面那条路一次都不该被调用；这里让邮件永远不回，只观察 ui 有没有被碰
+    void answerer.handle({ toolName: 'bash', agent: { session: { id: 's' } } }, () => { uiCalled = true; return new Promise(() => {}) })
+      .catch(() => {}) // 卸载时会被 reject：这是 fail-closed 的正常行为
+    await waitFor(() => smtp.messages.length === 1, { what: '通知邮件发出' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(uiCalled, false, '默认模式下不该把请求交给界面')
+  } finally {
+    await answerer.stop()
+    await smtp.close()
+  }
+})
+
+await checkAsync('提问默认不弹界面卡（卡片弹出来就收不掉）', async () => {
+  const smtp = await startFakeSmtp()
+  const settings = readSettings({
+    address: ADDRESS, authCode: 'x',
+    smtp: { host: '127.0.0.1', port: smtp.port, secure: false },
+    imap: { host: '127.0.0.1', port: 1, secure: false },
+    pollIntervalMs: 30,
+    auditFile: join(scratch, 'audit-q2.jsonl'),
+  })
+  assert.equal(settings.showQuestionCard, false, '默认必须是不弹卡')
+  const answerer = createAnswerer({
+    settings,
+    deps: { sendMail, createWatcher: (options) => new MailboxWatcher(options), log: () => {}, auditFile: join(scratch, 'audit-q2.jsonl') },
+    kind: 'question',
+  })
+  let uiCalled = false
+  try {
+    void answerer.handle({ ...QUESTION_REQUEST, agent: { session: { id: 's' } } }, () => { uiCalled = true; return new Promise(() => {}) })
+      .catch(() => {})
+    await waitFor(() => smtp.messages.length === 1, { what: '提问邮件发出' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(uiCalled, false, '默认模式下不该把提问交给界面')
   } finally {
     await answerer.stop()
     await smtp.close()

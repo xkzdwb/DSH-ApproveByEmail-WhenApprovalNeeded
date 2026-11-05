@@ -1,10 +1,13 @@
-# 把这段追加到 ~/.dsh/profiles/<profile>/cordis.patch.yml 的 insert 列表里。
+﻿# 把这段追加到 ~/.dsh/profiles/<profile>/cordis.patch.yml 的 insert 列表里。
 #
 # 说明：
 # - name 指向本仓库里的插件文件，必须是机器上的绝对路径（Windows 用正斜杠更稳）。
 # - 插件跑在 DSH HOST 进程里（不受会话沙盒限制），所以能直接收发邮件。
 # - 装在 profile 级 = 任意工作区的会话都生效。
-# - address 是「发信 + 收回复」的邮箱；to 是「收通知」的邮箱；allowFrom 是「谁有资格审批」。
+# - 同一个插件管两条通道：
+#     approval/request        → 审批邮件（回「同意 / 拒绝」）
+#     user-questions/request  → 提问邮件（回「1. 2」；答完界面上的选项按钮自动收起）
+# - address 是「发信 + 收回复」的邮箱；to 是「收通知」的邮箱；allowFrom 是「谁有资格审批 / 作答」。
 #   三者可以是同一个地址（自己发给自己），也可以像下面这样分成两个账号。
 # - 授权码不要写在这里，放 secrets.json（见 .gitignore）。
 # - 改完需要重启 DSH 才会加载。
@@ -20,5 +23,11 @@
         pollIntervalMs: 5000
         # 0 = 永不超时，一直等你回复
         waitMs: 0
-        # true = 只发通知，回复不作为放行依据
+        # 审批是否同时在界面弹卡。默认 false：审批卡弹出后没有 Host 侧关闭通道，
+        # 邮件批完会留在屏幕上。true = 并行抢答（卡片可能残留）。
+        # 提问不受影响：永远弹卡，答完由投影自动收卡。
+        showApprovalCard: false
+        # 提问是否同时在界面弹选项卡（默认 false，理由同上：弹出来就收不掉）。
+        showQuestionCard: false
+        # true = 只发通知，回复不作为放行依据（仅对审批生效）
         notifyOnly: false

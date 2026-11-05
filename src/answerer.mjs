@@ -1,25 +1,81 @@
-// 审批应答核心：一个「最外层」应答者。
-//   1. 先把请求交给下游（浏览器弹窗）——所以界面照旧弹，不会因为邮件而变慢；
-//   2. 同时发一封通知邮件，并开始轮询收件箱等你的回复；
-//   3. 两条路谁先给出结论就用谁：界面 = allowed-once/rejected，邮件 = allowed-once/rejected。
-// 邮件这条线永不超时（按你的要求持续等待）；turn 被中止时由 DSH 侧裁定 cancelled，
-// 这里只负责把待办清理干净，不让轮询泄漏。
+// 应答核心：一套机制，两种用途。
+//   审批（approval/request）  → 结论是 allowed-once / rejected
+//   提问（user-questions/request）→ 结论是 { answers: [{ id, selected, custom? }] }
+//
+// 共同点：抢一个一次性令牌 → 发邮件 → 轮询收件箱 → 你把回复发回来 → 带着结论返回。
+// 差别只在「邮件怎么渲染」和「回复怎么解释」，所以这两件事做成可替换的适配器。
+//
+// 界面那条路（是否先 next() 交给浏览器）两者不同：
+//   · 提问：一定要交给界面（弹选项卡）。你在邮件里答完后，工具调用结束、会话投影关闭，
+//     卡片由投影自动收掉 —— 这正是「邮件回复后收回选项按钮」的实现方式。
+//   · 审批：卡片一旦弹出就没有 Host 侧的关闭通道（客户端只在用户点击或插件卸载时销毁它），
+//     所以默认不弹，免得邮件批完之后屏幕上留一张永远不消失的卡。想要旧的并行模式把
+//     showApprovalCard 设成 true。
 import { newToken } from './token.mjs'
 import { buildNotification } from './notify.mjs'
 import { screenHeaders, readDecision } from './decision.mjs'
+import { buildQuestionMail, interpretAnswer } from './questions.mjs'
 import { appendAudit } from './audit.mjs'
 import { newMessageId } from './mime.mjs'
+import { parseHeaders, parseMessage, extractNewText } from './mime.mjs'
+import { extractTokens } from './token.mjs'
+
+/**
+ * 先从邮件里认出「这是哪个待办」。必须先定令牌，才能拿到对应的请求
+ * （提问的解析要知道题目与选项，而题目在请求里）。
+ * @param headerText - header 区。
+ * @param bodyText - 正文区（latin1）。
+ * @param tokens - 当前待办令牌集合。
+ * @returns 命中的令牌，或 null。
+ */
+function findToken(headerText, bodyText, tokens) {
+  const subject = parseHeaders(headerText).decoded('subject') ?? ''
+  const body = parseMessage(headerText, bodyText)
+  const fresh = extractNewText(body)
+  const open = new Set(tokens)
+  const inSubject = extractTokens(subject).filter((token) => open.has(token))
+  if (inSubject.length > 0) return inSubject[0]
+  const inBody = extractTokens(`${fresh}\n${body}`).filter((token) => open.has(token))
+  return inBody[0] ?? null
+}
+
+/** 审批的适配器：邮件模板 + 「同意/拒绝」解析。 */
+const APPROVAL = {
+  label: '审批',
+  render: ({ settings, token, req, now }) => buildNotification({ settings, token, req, now }),
+  interpret: ({ headerText, bodyText, tokens }) => {
+    const result = readDecision({ headerText, bodyText, tokens })
+    const value = result.decision === null ? null : result.decision === 'allow' ? 'allowed-once' : 'rejected'
+    return { token: result.token, value, note: result.note }
+  },
+  describeAsked: (req) => `工具 ${req?.toolName ?? '?'}`,
+  describeValue: (value) => String(value),
+}
+
+/** 提问的适配器：选项清单 + 序号/原文/自定义解析。 */
+const QUESTION = {
+  label: '提问',
+  render: ({ settings, token, req, now }) => buildQuestionMail({ settings, token, request: req, now }),
+  interpret: ({ headerText, bodyText, tokens, req }) => interpretAnswer({ headerText, bodyText, tokens, request: req }),
+  describeAsked: (req) => `${Array.isArray(req?.questions) ? req.questions.length : 0} 道题`,
+  describeValue: (value) => {
+    const answers = Array.isArray(value?.answers) ? value.answers : []
+    return answers.map((item) => `${item.id}:${item.selected.join('|')}${item.custom === undefined ? '' : '+custom'}`).join(' ')
+  },
+}
 
 /**
  * 造一个应答者。
  * @param options.settings - readSettings() 的产物。
  * @param options.deps - { sendMail, createWatcher, log, auditFile, now }
- * @returns { handle(req, next), stop(), pendingCount() }
+ * @param options.kind - 'approval' | 'question'
+ * @returns { handle(req, next), stop(), pendingCount(), pendingTokens() }
  */
-export function createAnswerer({ settings, deps }) {
+export function createAnswerer({ settings, deps, kind = 'approval' }) {
   const { sendMail, createWatcher, log, auditFile, now = () => new Date() } = deps
+  const adapter = kind === 'question' ? QUESTION : APPROVAL
 
-  /** token → { resolve, req, messageId, askedAt } */
+  /** token → { resolve, fail, req, messageId, askedAt } */
   const pending = new Map()
   let watcher = null
   let timer = null
@@ -28,7 +84,7 @@ export function createAnswerer({ settings, deps }) {
   let lastPollError = null
 
   function audit(record) {
-    void appendAudit(auditFile, record, log)
+    void appendAudit(auditFile, { kind: adapter.label, ...record }, log)
   }
 
   function uniqueToken() {
@@ -44,7 +100,7 @@ export function createAnswerer({ settings, deps }) {
     const entry = pending.get(token)
     if (entry !== undefined) entry.messageId = messageId
 
-    const { subject, text, html } = buildNotification({ settings, token, req, now: now() })
+    const { subject, text, html } = adapter.render({ settings, token, req, now: now() })
     await sendMail({
       ...settings.smtp,
       user: settings.user,
@@ -62,8 +118,8 @@ export function createAnswerer({ settings, deps }) {
       },
       log,
     })
-    audit({ kind: 'asked', token, messageId, tool: req?.toolName, reason: req?.reason, session: req?.agent?.session?.id })
-    log(`已发出审批邮件 #${token}（工具 ${req?.toolName ?? '?'}）`)
+    audit({ kind: 'asked', token, messageId, what: adapter.describeAsked(req), session: req?.agent?.session?.id })
+    log(`已发出${adapter.label}邮件 #${token}（${adapter.describeAsked(req)}）`)
   }
 
   // ---- 收件箱轮询 ----
@@ -106,23 +162,32 @@ export function createAnswerer({ settings, deps }) {
   /** 处理一封候选邮件：认令牌 → 出结论。 */
   function handleMessage(message) {
     const tokens = [...pending.keys()]
-    const result = readDecision({ headerText: message.headerText, bodyText: message.bodyText, tokens })
-    if (result.token === null) {
+    const token = findToken(message.headerText, message.bodyText, tokens)
+    if (token === null) {
       log(`收到一封像回复的邮件（UID ${message.uid}），但没有待办令牌对得上，忽略`)
       return
     }
-    const entry = pending.get(result.token)
+    const entry = pending.get(token)
     if (entry === undefined) return
-    if (result.decision === null) {
-      log(`#${result.token} 的回复没读明白（${result.note}），继续等`)
+    const result = adapter.interpret({
+      headerText: message.headerText,
+      bodyText: message.bodyText,
+      tokens,
+      req: entry.req,
+    })
+    if (result.token === null) {
+      log(`收到一封像回复的邮件（UID ${message.uid}），但令牌对不上，忽略`)
+      return
+    }
+    if (result.value === null || result.value === undefined) {
+      log(`#${result.token} 的回复没读明白（${result.note ?? '无结论'}），继续等`)
       audit({ kind: 'unreadable', token: result.token, uid: message.uid, note: result.note })
       return
     }
     pending.delete(result.token)
-    const outcome = result.decision === 'allow' ? 'allowed-once' : 'rejected'
-    audit({ kind: 'decided', token: result.token, uid: message.uid, decision: result.decision, outcome, source: 'email' })
-    log(`按邮件回复 #${result.token}：${result.decision === 'allow' ? '批准' : '拒绝'}`)
-    entry.resolve(outcome)
+    audit({ kind: 'decided', token: result.token, uid: message.uid, result: adapter.describeValue(result.value), source: 'email' })
+    log(`按邮件回复 #${result.token}：${adapter.describeValue(result.value)}`)
+    entry.resolve(result.value)
   }
 
   async function tick() {
@@ -156,49 +221,68 @@ export function createAnswerer({ settings, deps }) {
   // ---- 对外接口 ----
 
   /**
-   * 一个待审批请求进来。
-   * @param req - approval/request 的请求对象。
-   * @param next - 下游应答者（桌面端就是浏览器弹窗）。
-   * @returns 四个结论之一。
+   * 一个待决策请求进来。
+   * @param req - approval/request 或 user-questions/request 的请求对象。
+   * @param next - 下游应答者（桌面端就是浏览器界面）。
+   * @returns 结论：审批是四个词之一；提问是 AskUserQuestionAnswer。
    */
   async function handle(req, next) {
-    // 立刻把请求转给下游：界面弹窗不等邮件。
-    const downstream = Promise.resolve().then(() => next())
+    // 是否同时把请求交给界面。两条通道默认都不交，原因同一个（已用客户端源码确认）：
+    // 客户端一旦收到转发请求，卡片就只能由「用户点击 / 客户端自己作答」结束 ——
+    // 它 reconcile 时对 card.hasRequest() / hasWaterfall() 的卡片直接 continue，永不删除，
+    // 投影关不关都没用。所以「邮件答完 ⇒ 卡片自动消失」在转发的前提下做不到；
+    // 卡片弹出来却收不掉，比不弹更糟。想弹卡就把对应的开关打开。
+    const wantsUi = (kind === 'question' ? settings.showQuestionCard : settings.showApprovalCard) === true
+    const ui = Promise.withResolvers()
+    let uiStarted = false
+    const startUi = () => {
+      if (uiStarted) return
+      uiStarted = true
+      Promise.resolve().then(() => next()).then(ui.resolve, ui.reject)
+    }
+    if (wantsUi) startUi()
 
     const token = uniqueToken()
-    if (settings.notifyOnly) {
-      pending.set(token, { resolve: () => {}, req, messageId: undefined, askedAt: now().toISOString() })
+    if (kind === 'approval' && settings.notifyOnly) {
+      pending.set(token, { resolve: () => {}, fail: () => {}, req, messageId: undefined, askedAt: now().toISOString() })
       void notify(token, req)
         .catch((error) => log(`通知邮件发送失败（界面审批不受影响）：${error?.message ?? error}`))
         .finally(() => pending.delete(token))
-      return downstream
+      startUi()
+      return ui.promise
     }
 
     let settle
-    const emailAnswer = new Promise((resolve) => {
+    let fail
+    const emailAnswer = new Promise((resolve, reject) => {
       settle = resolve
+      fail = reject
     })
-    pending.set(token, { resolve: settle, req, messageId: undefined, askedAt: now().toISOString() })
+    // 卸载/中止时这里会 reject；调用方可能已经走开（比如 turn 被中止后），
+    // 挂一个空 catch 免得变成 unhandledRejection 把宿主进程带下去。
+    void emailAnswer.catch(() => {})
+    pending.set(token, { resolve: settle, fail, req, messageId: undefined, askedAt: now().toISOString() })
 
     const onAbort = () => {
       if (pending.delete(token)) {
         audit({ kind: 'abandoned', token, reason: 'turn 被中止' })
-        settle('cancelled')
+        fail(new Error('turn 被中止'))
       }
     }
     req?.signal?.addEventListener?.('abort', onAbort, { once: true })
 
     ensureWatcher()
     void notify(token, req).catch((error) => {
-      // 邮件出不去就撤掉这个令牌：只留界面这条线，绝不因为邮件故障而误放行或卡住。
       pending.delete(token)
-      log(`审批邮件发送失败（本请求改由界面审批）：${error?.message ?? error}`)
+      log(`${adapter.label}邮件发送失败（${uiStarted ? '界面那条路不受影响' : '改由界面处理'}）：${error?.message ?? error}`)
       audit({ kind: 'notify-failed', token, error: String(error?.message ?? error) })
+      // 邮件出不去时兜底：回到界面，绝不把请求卡死在无人可见的状态。
+      startUi()
     })
 
     try {
-      const outcome = await Promise.race([downstream, emailAnswer])
-      audit({ kind: 'settled', token, outcome, source: 'race' })
+      const outcome = await Promise.race([ui.promise, emailAnswer])
+      audit({ kind: 'settled', token, result: adapter.describeValue(outcome), source: uiStarted ? 'race' : 'email' })
       return outcome
     } finally {
       pending.delete(token)
@@ -210,7 +294,7 @@ export function createAnswerer({ settings, deps }) {
   async function stop() {
     for (const [token, entry] of [...pending.entries()]) {
       pending.delete(token)
-      entry.resolve('unavailable')
+      entry.fail(new Error('approval-email 已卸载，等待中的请求已放掉'))
     }
     stopWatcher()
   }

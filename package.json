@@ -1,9 +1,9 @@
-{
+﻿{
   "name": "dsh-approve-by-email",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "DSH 审批邮件通道：需要人工审批时发一封邮件，回复邮件（或点界面弹窗）即可放行；与界面弹窗并行抢答，零依赖",
+  "description": "DSH 的邮件通道：需要审批时发邮件、回复即可放行；AI 给出选项让你选时也发邮件，答完界面选项卡自动收起。零依赖",
   "license": "MIT",
   "engines": {
     "node": ">=20"

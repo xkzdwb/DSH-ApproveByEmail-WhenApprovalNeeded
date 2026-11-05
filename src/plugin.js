@@ -1,6 +1,8 @@
-﻿// DSH 插件入口：把「邮件审批通道」挂到 approval/request 瀑布的最外层。
+﻿// DSH 插件入口：把「邮件通道」挂到两个瀑布的最外层。
+//   approval/request        审批（提权、写工作区外……）
+//   user-questions/request  提问（AI 给出选项让你选）
 //
-// 为什么是 prepend：桌面端已经有一个最终应答者（浏览器弹窗，经 dsh-api-remotes 转发），
+// 为什么是 prepend：桌面端这两个事件都已经有最终应答者（浏览器界面，经 dsh-api-remotes 转发），
 // 它会把请求整个吃掉。不抢在最外层，邮件永远发不出去。
 //
 // 装配（~/.dsh/profiles/desktop/cordis.patch.yml 的 insert 列表）：
@@ -39,25 +41,33 @@ function apply(ctx, rawConfig) {
     return
   }
 
-  const answerer = createAnswerer({
-    settings,
-    deps: {
-      sendMail,
-      createWatcher: (options) => new MailboxWatcher(options),
-      log,
-      auditFile: settings.auditFile === '' ? join(here, '..', 'audit', 'audit.jsonl') : settings.auditFile,
-    },
+  const deps = {
+    sendMail,
+    createWatcher: (options) => new MailboxWatcher(options),
+    log,
+    auditFile: settings.auditFile === '' ? join(here, '..', 'audit', 'audit.jsonl') : settings.auditFile,
+  }
+
+  const approvals = createAnswerer({ settings, deps, kind: 'approval' })
+  const questions = createAnswerer({ settings, deps, kind: 'question' })
+
+  ctx.on('approval/request', (req, next) => approvals.handle(req, next), { prepend: true })
+
+  // 提问服务由 dsh-user-questions 提供；没有这个服务的部署里，这一段自动不生效。
+  ctx.inject(['userQuestions'], (scope) => {
+    scope.on('user-questions/request', (req, next) => questions.handle(req, next), { prepend: true })
   })
 
-  ctx.on('approval/request', (req, next) => answerer.handle(req, next), { prepend: true })
   ctx.effect(() => () => {
-    log('正在卸载：放掉等待中的审批与收信连接')
-    void answerer.stop()
-  }, `${name}: 邮件审批通道`)
+    log('正在卸载：放掉等待中的审批/提问与收信连接')
+    void approvals.stop()
+    void questions.stop()
+  }, `${name}: 邮件审批与提问通道`)
 
   log(`已挂载：${settings.address}（SMTP ${settings.smtp.host}:${settings.smtp.port}，IMAP ${settings.imap.host}:${settings.imap.port}，`
     + `轮询 ${settings.pollIntervalMs}ms，${settings.waitMs === 0 ? '永不超时' : `${settings.waitMs}ms 超时`}`
-    + `${settings.notifyOnly ? '，仅通知模式' : ''}）`)
+    + `${settings.notifyOnly ? '，仅通知模式' : ''}`
+    + `，审批界面卡${settings.showApprovalCard ? '开' : '关'}，提问邮件与选项卡并行）`)
 }
 
 export { apply, inject, name }
