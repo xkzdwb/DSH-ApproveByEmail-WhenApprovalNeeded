@@ -1,0 +1,26 @@
+{
+  "name": "dsh-approve-by-email",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 审批邮件通道：需要人工审批时发一封邮件，回复邮件（或点界面弹窗）即可放行；与界面弹窗并行抢答，零依赖",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek",
+    "cordis",
+    "plugin",
+    "approval",
+    "permission",
+    "email",
+    "smtp",
+    "imap"
+  ],
+  "scripts": {
+    "test": "node test/run-tests.mjs",
+    "probe": "node tools/probe-mail.mjs"
+  }
+}

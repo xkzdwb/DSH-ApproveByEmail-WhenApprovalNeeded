@@ -1,0 +1,24 @@
+# 把这段追加到 ~/.dsh/profiles/<profile>/cordis.patch.yml 的 insert 列表里。
+#
+# 说明：
+# - name 指向本仓库里的插件文件，必须是机器上的绝对路径（Windows 用正斜杠更稳）。
+# - 插件跑在 DSH HOST 进程里（不受会话沙盒限制），所以能直接收发邮件。
+# - 装在 profile 级 = 任意工作区的会话都生效。
+# - address 是「发信 + 收回复」的邮箱；to 是「收通知」的邮箱；allowFrom 是「谁有资格审批」。
+#   三者可以是同一个地址（自己发给自己），也可以像下面这样分成两个账号。
+# - 授权码不要写在这里，放 secrets.json（见 .gitignore）。
+# - 改完需要重启 DSH 才会加载。
+- insert:
+    - id: approval-email
+      name: "/absolute/path/to/DSH-ApproveByEmail-WhenApprovalNeeded/src/plugin.js"
+      config:
+        address: sender@example.com
+        to: approver@example.com
+        allowFrom:
+          - approver@example.com
+        secretsFile: "/absolute/path/to/DSH-ApproveByEmail-WhenApprovalNeeded/secrets.json"
+        pollIntervalMs: 5000
+        # 0 = 永不超时，一直等你回复
+        waitMs: 0
+        # true = 只发通知，回复不作为放行依据
+        notifyOnly: false
