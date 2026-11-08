@@ -1,0 +1,6 @@
+# dsh-approve-by-email — DSH 的邮件通道：需要审批时发邮件、回复即可放行；AI 给出选项让你选时也发邮件，答完界面选项卡自动收起。零依赖
+# 这个文件由 dsh-market-sync 自动补：市场收录要求根目录有 cordis 标记。
+- insert:
+    - id: approve-by-email
+      name: 'dsh-approve-by-email'
+      config: {}
